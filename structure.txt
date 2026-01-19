@@ -1,0 +1,30 @@
+.
+├── Makefile
+├── doc
+│   └── pg_deadlock_log.md
+├── expected
+│   └── pg_deadlock_log.out
+├── pg_deadlock_log--1.0.sql
+├── pg_deadlock_log.c
+├── pg_deadlock_log.control
+├── pg_deadlock_log_context.c
+├── pg_deadlock_log_insert.c
+├── pg_deadlock_log_internal.h
+├── pg_deadlock_log_v.c
+├── pytest.ini
+├── requirements.txt
+├── run_tests.sh
+├── sql
+│   ├── pg_deadlock_log.sql
+│   └── pg_deadlock_log_deadlock.sql
+├── structure.txt
+└── tests
+    ├── __init__.py
+    ├── conftest.py
+    ├── helpers.py
+    ├── test_core.py
+    ├── test_metadata.py
+    ├── test_network.py
+    └── test_schema_and_errors.py
+
+5 directories, 23 files

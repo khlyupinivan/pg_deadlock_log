@@ -1,0 +1,68 @@
+-- Загружаем расширение
+CREATE EXTENSION pg_deadlock_log;
+
+-- Проверяем, что таблица существует и в нужной схеме
+SELECT n.nspname AS schema_name,
+       c.relname AS table_name
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relname = 'pg_deadlock_log'
+ORDER BY 1, 2;
+ schema_name |   table_name    
+-------------+-----------------
+ public      | pg_deadlock_log
+(1 row)
+
+
+-- Проверяем структуру (минимально: имена колонок и типы)
+SELECT attnum,
+       attname,
+       format_type(atttypid, atttypmod) AS type
+FROM pg_attribute
+WHERE attrelid = 'pg_deadlock_log'::regclass
+  AND attnum > 0
+  AND NOT attisdropped
+ORDER BY attnum;
+ attnum |     attname      |           type           
+--------+------------------+--------------------------
+      1 | id               | bigint
+      2 | occurred_at      | timestamp with time zone
+      3 | database_name    | name
+      4 | user_name        | name
+      5 | pid_victim       | integer
+      6 | query            | text
+      7 | error_message    | text
+      8 | error_detail     | text
+      9 | application_name | text
+     10 | client_addr      | text
+(10 rows)
+
+
+-- Проверяем GUC-параметры
+SHOW pg_deadlock_log.enabled;
+ pg_deadlock_log.enabled 
+-------------------------
+ on
+(1 row)
+
+SHOW pg_deadlock_log.store_query;
+ pg_deadlock_log.store_query 
+-----------------------------
+ on
+(1 row)
+
+SHOW pg_deadlock_log.schema;
+ pg_deadlock_log.schema 
+------------------------
+ public
+(1 row)
+
+
+-- Меняем schema в сессии и проверяем, что GUC меняется
+SET pg_deadlock_log.schema = 'public';
+SHOW pg_deadlock_log.schema;
+ pg_deadlock_log.schema 
+------------------------
+ public
+(1 row)
+
