@@ -1,6 +1,5 @@
-comment = 'Deadlock observability extension: logs deadlock victim info into pg_deadlock_log table'
+comment = 'Deadlock observability extension: logs deadlock victim and all participants with lock cycle graph into pg_deadlock_log table'
 default_version = '1.0'
 module_pathname = '$libdir/pg_deadlock_log'
 relocatable = false
 schema = public
-requires = ''

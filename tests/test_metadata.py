@@ -1,24 +1,30 @@
-import time
 import psycopg2
 import pytest
 
-from .helpers import PG_DSN, make_conn, _make_deadlock, _make_deadlock_with_pids, setup_extension
+from .helpers import (
+    PG_DSN, make_conn, _make_deadlock, _make_deadlock_with_pids,
+    setup_extension, wait_for_deadlock_log,
+)
+
+
+def _assert_deadlock(all_exc):
+    assert all_exc, "Ожидали хотя бы одну ошибку из-за дедлока"
+    assert any(
+        isinstance(e, psycopg2.Error) and getattr(e, "pgcode", None) == "40P01"
+        for e in all_exc
+    ), f"Нет 40P01 среди: {[(type(e), getattr(e, 'pgcode', None)) for e in all_exc]}"
+
 
 @pytest.mark.usefixtures("clean_log", "setup_lock_table")
 def test_deadlock_log_custom_schema():
-    """
-    Если pg_deadlock_log.schema = 'deadlock_log', запись должна попадать в эту схему.
-    """
+    """Запись должна попадать в указанную схему."""
     schema = "deadlock_log"
-
-    # Подготовка схемы и таблицы-аналога
     conn_admin = psycopg2.connect(PG_DSN)
     conn_admin.autocommit = True
     try:
         with conn_admin.cursor() as cur:
             cur.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE;")
             cur.execute(f"CREATE SCHEMA {schema};")
-            # создаём таблицу в новой схеме по образцу public.pg_deadlock_log
             cur.execute(f"""
                 CREATE TABLE {schema}.pg_deadlock_log (
                     LIKE public.pg_deadlock_log INCLUDING ALL
@@ -27,22 +33,11 @@ def test_deadlock_log_custom_schema():
     finally:
         conn_admin.close()
 
-    conn1 = make_conn()
-    conn2 = make_conn()
-
+    conn1, conn2 = make_conn(), make_conn()
     try:
-        # Включаем расширение и указываем схему для логов
         for conn in (conn1, conn2):
             setup_extension(conn, enabled=True, store_query=True, schema=schema)
-
-        all_exc = _make_deadlock(conn1, conn2)
-
-        assert all_exc, "Ожидали хотя бы одну ошибку из-за дедлока"
-        assert any(
-            isinstance(e, psycopg2.Error)
-            and getattr(e, "pgcode", None) == "40P01"
-            for e in all_exc
-        ), f"Нет ошибки deadlock (40P01), были: {[(type(e), getattr(e, 'pgcode', None), str(e)) for e in all_exc]}"
+        _assert_deadlock(_make_deadlock(conn1, conn2))
     finally:
         for conn in (conn1, conn2):
             try:
@@ -50,55 +45,32 @@ def test_deadlock_log_custom_schema():
             except Exception:
                 pass
 
-    time.sleep(0.2)
+    assert wait_for_deadlock_log(PG_DSN, schema=schema), \
+        f"Запись не появилась в {schema}.pg_deadlock_log"
 
     conn_check = psycopg2.connect(PG_DSN)
     conn_check.autocommit = True
     try:
         with conn_check.cursor() as cur:
-            # убеждаемся, что таблица в схеме существует
-            cur.execute("""
-                SELECT 1
-                  FROM information_schema.tables
-                 WHERE table_schema = %s
-                   AND table_name = 'pg_deadlock_log';
-            """, (schema,))
-            assert cur.fetchone() is not None, "Таблица схемы для логов не найдена"
-
             cur.execute(f"SELECT count(*) FROM {schema}.pg_deadlock_log;")
             cnt, = cur.fetchone()
-        assert cnt >= 1, (
-            f"Ожидали хотя бы одну запись в {schema}.pg_deadlock_log, получили {cnt}"
-        )
+        assert cnt >= 1
     finally:
         conn_check.close()
 
+
 @pytest.mark.usefixtures("clean_log", "setup_lock_table")
 def test_deadlock_log_application_name():
-    """
-    В лог должна попадать application_name жертвы дедлока.
-    """
+    """В лог должна попадать application_name жертвы."""
     app_name = "pg_deadlock_log_test_app"
-
-    conn1 = make_conn()
-    conn2 = make_conn()
-
+    conn1, conn2 = make_conn(), make_conn()
     try:
-        # Задаём application_name и включаем расширение
         for i, conn in enumerate((conn1, conn2), start=1):
             setup_extension(conn, enabled=True, store_query=True, schema="public")
             with conn.cursor() as cur:
                 cur.execute("SET application_name = %s;", (f"{app_name}_{i}",))
-                conn.commit()
-
-        all_exc = _make_deadlock(conn1, conn2)
-
-        assert all_exc, "Ожидали хотя бы одну ошибку из-за дедлока"
-        assert any(
-            isinstance(e, psycopg2.Error)
-            and getattr(e, "pgcode", None) == "40P01"
-            for e in all_exc
-        ), f"Нет ошибки deadlock (40P01), были: {[(type(e), getattr(e, 'pgcode', None), str(e)) for e in all_exc]}"
+            conn.commit()
+        _assert_deadlock(_make_deadlock(conn1, conn2))
     finally:
         for conn in (conn1, conn2):
             try:
@@ -106,50 +78,32 @@ def test_deadlock_log_application_name():
             except Exception:
                 pass
 
-    time.sleep(0.2)
+    assert wait_for_deadlock_log(PG_DSN)
 
     conn_check = psycopg2.connect(PG_DSN)
     conn_check.autocommit = True
     try:
         with conn_check.cursor() as cur:
             cur.execute("""
-                SELECT application_name, query, error_message
-                  FROM public.pg_deadlock_log
-              ORDER BY id DESC
-                 LIMIT 1;
+                SELECT application_name FROM public.pg_deadlock_log ORDER BY id DESC LIMIT 1;
             """)
             row = cur.fetchone()
-
-        assert row is not None, "Запись о дедлоке не найдена в pg_deadlock_log"
-        logged_app_name, query, err = row
-
-        # Ожидаем, что application_name соответствует одной из наших сессий
-        assert logged_app_name in (f"{app_name}_1", f"{app_name}_2"), (
-            f"Неожиданное application_name в логе: {logged_app_name!r}"
-        )
+        assert row is not None
+        logged_app_name, = row
+        assert logged_app_name in (f"{app_name}_1", f"{app_name}_2"), \
+            f"Неожиданное application_name: {logged_app_name!r}"
     finally:
         conn_check.close()
+
 
 @pytest.mark.usefixtures("clean_log", "setup_lock_table")
 def test_deadlock_log_db_and_user():
-    """
-    В лог должны попадать правильные database_name и user_name.
-    """
-    conn1 = make_conn()
-    conn2 = make_conn()
-
+    """В лог должны попадать правильные database_name и user_name."""
+    conn1, conn2 = make_conn(), make_conn()
     try:
         for conn in (conn1, conn2):
             setup_extension(conn, enabled=True, store_query=True, schema="public")
-
-        all_exc = _make_deadlock(conn1, conn2)
-
-        assert all_exc, "Ожидали хотя бы одну ошибку из-за дедлока"
-        assert any(
-            isinstance(e, psycopg2.Error)
-            and getattr(e, "pgcode", None) == "40P01"
-            for e in all_exc
-        ), f"Нет ошибки deadlock (40P01), были: {[(type(e), getattr(e, 'pgcode', None), str(e)) for e in all_exc]}"
+        _assert_deadlock(_make_deadlock(conn1, conn2))
     finally:
         for conn in (conn1, conn2):
             try:
@@ -157,54 +111,40 @@ def test_deadlock_log_db_and_user():
             except Exception:
                 pass
 
-    time.sleep(0.2)
+    assert wait_for_deadlock_log(PG_DSN)
 
     conn_check = psycopg2.connect(PG_DSN)
     conn_check.autocommit = True
     try:
         with conn_check.cursor() as cur:
             cur.execute("""
-                SELECT database_name, user_name, query
-                  FROM public.pg_deadlock_log
-              ORDER BY id DESC
-                 LIMIT 1;
+                SELECT database_name, user_name FROM public.pg_deadlock_log ORDER BY id DESC LIMIT 1;
             """)
             row = cur.fetchone()
+            assert row is not None
+            db_name, user_name = row
 
-        assert row is not None, "Запись о дедлоке не найдена в pg_deadlock_log"
-        db_name, user_name, query = row
-
-        # сравниваем с текущими значениями в проверочном соединении
-        with conn_check.cursor() as cur:
             cur.execute("SELECT current_database(), current_user;")
             exp_db, exp_user = cur.fetchone()
 
-        assert db_name == exp_db, f"database_name в логе {db_name!r}, ожидали {exp_db!r}"
-        assert user_name == exp_user, f"user_name в логе {user_name!r}, ожидали {exp_user!r}"
+        assert db_name == exp_db, f"database_name: {db_name!r} != {exp_db!r}"
+        assert user_name == exp_user, f"user_name: {user_name!r} != {exp_user!r}"
     finally:
         conn_check.close()
+
 
 @pytest.mark.usefixtures("clean_log", "setup_lock_table")
 def test_deadlock_log_error_message_and_detail():
     """
-    В лог должны корректно попадать error_message и error_detail для дедлока.
+    error_message должен содержать 'deadlock'.
+    error_detail — пустая строка: хук вызывается до генерации ErrorData.
+    Граф блокировок логируется в поле lock_cycle.
     """
-    conn1 = make_conn()
-    conn2 = make_conn()
-
+    conn1, conn2 = make_conn(), make_conn()
     try:
         for conn in (conn1, conn2):
             setup_extension(conn, enabled=True, store_query=True, schema="public")
-
-        all_exc = _make_deadlock(conn1, conn2)
-
-        # Убедимся, что дедлок действительно произошёл
-        assert all_exc, "Ожидали хотя бы одну ошибку из-за дедлока"
-        assert any(
-            isinstance(e, psycopg2.Error)
-            and getattr(e, "pgcode", None) == "40P01"
-            for e in all_exc
-        ), f"Нет ошибки deadlock (40P01), были: {[(type(e), getattr(e, 'pgcode', None), str(e)) for e in all_exc]}"
+        _assert_deadlock(_make_deadlock(conn1, conn2))
     finally:
         for conn in (conn1, conn2):
             try:
@@ -212,60 +152,44 @@ def test_deadlock_log_error_message_and_detail():
             except Exception:
                 pass
 
-    time.sleep(0.2)
+    assert wait_for_deadlock_log(PG_DSN)
 
     conn_check = psycopg2.connect(PG_DSN)
     conn_check.autocommit = True
     try:
         with conn_check.cursor() as cur:
             cur.execute("""
-                SELECT error_message, error_detail
+                SELECT error_message, error_detail, lock_cycle
                   FROM public.pg_deadlock_log
-              ORDER BY id DESC
-                 LIMIT 1;
+              ORDER BY id DESC LIMIT 1;
             """)
             row = cur.fetchone()
+        assert row is not None
+        error_message, error_detail, lock_cycle = row
 
-        assert row is not None, "Запись о дедлоке не найдена в pg_deadlock_log"
-        error_message, error_detail = row
+        assert "deadlock" in (error_message or "").lower(), \
+            f"Ожидали 'deadlock' в error_message, получили: {error_message!r}"
 
-        msg = (error_message or "").lower()
-        detail = error_detail or ""
+        assert error_detail in ("", None), \
+            f"Ожидали пустой error_detail, получили: {error_detail!r}"
 
-        # Базовые ожидания
-        assert "deadlock" in msg, f"В error_message нет слова deadlock: {error_message!r}"
-        # DETAIL должен содержать хотя бы фрагменты вида 'Process N waits for' etc.
-        assert "process" in detail.lower(), f"error_detail выглядит странно: {error_detail!r}"
-        assert "waits for" in detail.lower(), f"error_detail не содержит 'waits for': {error_detail!r}"
+        assert lock_cycle not in (None, ""), "Ожидали непустой lock_cycle"
+        assert "waits for" in lock_cycle, \
+            f"lock_cycle не содержит 'waits for': {lock_cycle!r}"
     finally:
         conn_check.close()
+
 
 @pytest.mark.usefixtures("clean_log", "setup_lock_table")
 def test_deadlock_log_pid_victim_matches_backend():
-    """
-    pid_victim в логе должен совпадать с PID backend'а, который словил дедлок (40P01).
-    """
-    conn1 = make_conn()
-    conn2 = make_conn()
-
+    """pid_victim должен совпадать с PID backend'а-жертвы."""
+    conn1, conn2 = make_conn(), make_conn()
     try:
         for conn in (conn1, conn2):
             setup_extension(conn, enabled=True, store_query=True, schema="public")
-
         all_exc, pid1, pid2, victim_pid = _make_deadlock_with_pids(conn1, conn2)
-
-        assert all_exc, "Ожидали хотя бы одну ошибку из-за дедлока"
-        assert any(
-            isinstance(e, psycopg2.Error)
-            and getattr(e, "pgcode", None) == "40P01"
-            for e in all_exc
-        ), f"Нет ошибки deadlock (40P01), были: {[(type(e), getattr(e, 'pgcode', None), str(e)) for e in all_exc]}"
-
-        # Должны были хотя бы для одного соединения понять victim_pid
-        assert victim_pid in (pid1, pid2), (
-            f"Не удалось определить PID жертвы по исключениям, "
-            f"pid1={pid1}, pid2={pid2}, all_exc={all_exc}"
-        )
+        _assert_deadlock(all_exc)
+        assert victim_pid in (pid1, pid2)
     finally:
         for conn in (conn1, conn2):
             try:
@@ -273,57 +197,35 @@ def test_deadlock_log_pid_victim_matches_backend():
             except Exception:
                 pass
 
-    time.sleep(0.2)
+    assert wait_for_deadlock_log(PG_DSN)
 
     conn_check = psycopg2.connect(PG_DSN)
     conn_check.autocommit = True
     try:
         with conn_check.cursor() as cur:
             cur.execute("""
-                SELECT pid_victim, query, error_message
-                  FROM public.pg_deadlock_log
-              ORDER BY id DESC
-                 LIMIT 1;
+                SELECT pid_victim FROM public.pg_deadlock_log ORDER BY id DESC LIMIT 1;
             """)
             row = cur.fetchone()
-
-        assert row is not None, "Запись о дедлоке не найдена в pg_deadlock_log"
-        logged_pid_victim, query, err = row
-
-        assert logged_pid_victim in (pid1, pid2), (
-            f"pid_victim={logged_pid_victim}, но pid backend'ов были {pid1} и {pid2}"
-        )
-
-        # Если мы смогли однозначно определить victim_pid из исключений —
-        # проверим строгое совпадение
+        assert row is not None
+        logged_pid_victim, = row
+        assert logged_pid_victim in (pid1, pid2), \
+            f"pid_victim={logged_pid_victim}, pid'ы были {pid1} и {pid2}"
         if victim_pid is not None:
-            assert logged_pid_victim == victim_pid, (
-                f"Ожидали pid_victim={victim_pid} (по исключениям), "
-                f"но в логе {logged_pid_victim}"
-            )
+            assert logged_pid_victim == victim_pid, \
+                f"Ожидали pid_victim={victim_pid}, в логе {logged_pid_victim}"
     finally:
         conn_check.close()
 
+
 @pytest.mark.usefixtures("clean_log", "setup_lock_table")
 def test_deadlock_log_sqlstate():
-    """
-    В лог должен попадать корректный sqlstate для дедлока (40P01).
-    """
-    conn1 = make_conn()
-    conn2 = make_conn()
-
+    """sqlstate должен быть '40P01'."""
+    conn1, conn2 = make_conn(), make_conn()
     try:
         for conn in (conn1, conn2):
             setup_extension(conn, enabled=True, store_query=True, schema="public")
-
-        all_exc = _make_deadlock(conn1, conn2)
-
-        assert all_exc, "Ожидали хотя бы одну ошибку из-за дедлока"
-        assert any(
-            isinstance(e, psycopg2.Error)
-            and getattr(e, "pgcode", None) == "40P01"
-            for e in all_exc
-        ), f"Нет ошибки deadlock (40P01), были: {[(type(e), getattr(e, 'pgcode', None), str(e)) for e in all_exc]}"
+        _assert_deadlock(_make_deadlock(conn1, conn2))
     finally:
         for conn in (conn1, conn2):
             try:
@@ -331,58 +233,35 @@ def test_deadlock_log_sqlstate():
             except Exception:
                 pass
 
-    time.sleep(0.2)
+    assert wait_for_deadlock_log(PG_DSN)
 
     conn_check = psycopg2.connect(PG_DSN)
     conn_check.autocommit = True
     try:
         with conn_check.cursor() as cur:
             cur.execute("""
-                SELECT sqlstate, error_message
-                  FROM public.pg_deadlock_log
-              ORDER BY id DESC
-                 LIMIT 1;
+                SELECT sqlstate, error_message FROM public.pg_deadlock_log ORDER BY id DESC LIMIT 1;
             """)
             row = cur.fetchone()
-
-        assert row is not None, "Запись о дедлоке не найдена в pg_deadlock_log"
+        assert row is not None
         sqlstate, error_message = row
-
-        assert sqlstate == "40P01", f"Ожидали sqlstate='40P01', получили {sqlstate!r}"
+        assert sqlstate == "40P01", f"Ожидали '40P01', получили {sqlstate!r}"
         assert "deadlock" in (error_message or "").lower()
     finally:
         conn_check.close()
 
+
 @pytest.mark.usefixtures("clean_log", "setup_lock_table")
 def test_deadlock_log_search_path_captured():
-    """
-    В лог должен попадать search_path жертвы дедлока.
-    """
-    conn1 = make_conn()
-    conn2 = make_conn()
-
+    """В лог должен попадать search_path жертвы."""
+    conn1, conn2 = make_conn(), make_conn()
     try:
         for conn in (conn1, conn2):
             setup_extension(conn, enabled=True, store_query=True, schema="public")
             with conn.cursor() as cur:
                 cur.execute("SET search_path = myschema, public;")
-                conn.commit()
-
-        # Перед дедлоком убедимся, что t_lock видна в этих коннектах
-        with conn1.cursor() as cur:
-            cur.execute("SHOW search_path;")
-            print("conn1 search_path:", cur.fetchone())
-            cur.execute("SELECT count(*) FROM t_lock;")
-            print("conn1 t_lock count:", cur.fetchone())
-        
-        all_exc = _make_deadlock(conn1, conn2)
-
-        assert all_exc, "Ожидали хотя бы одну ошибку из-за дедлока"
-        assert any(
-            isinstance(e, psycopg2.Error)
-            and getattr(e, "pgcode", None) == "40P01"
-            for e in all_exc
-        ), f"Нет ошибки deadlock (40P01), были: {[(type(e), getattr(e, 'pgcode', None), str(e)) for e in all_exc]}"
+            conn.commit()
+        _assert_deadlock(_make_deadlock(conn1, conn2))
     finally:
         for conn in (conn1, conn2):
             try:
@@ -390,54 +269,37 @@ def test_deadlock_log_search_path_captured():
             except Exception:
                 pass
 
-    time.sleep(0.2)
+    assert wait_for_deadlock_log(PG_DSN)
 
     conn_check = psycopg2.connect(PG_DSN)
     conn_check.autocommit = True
     try:
         with conn_check.cursor() as cur:
             cur.execute("""
-                SELECT search_path
-                  FROM public.pg_deadlock_log
-              ORDER BY id DESC
-                 LIMIT 1;
+                SELECT search_path FROM public.pg_deadlock_log ORDER BY id DESC LIMIT 1;
             """)
             row = cur.fetchone()
-
-        assert row is not None, "Запись о дедлоке не найдена в pg_deadlock_log"
-        (logged_sp,) = row
-
+        assert row is not None
+        logged_sp, = row
         assert logged_sp is not None, "search_path в логе пустой"
-        assert "myschema" in logged_sp, f"Ожидали, что search_path содержит 'myschema', получили: {logged_sp!r}"
+        assert "myschema" in logged_sp, \
+            f"Ожидали 'myschema' в search_path, получили: {logged_sp!r}"
     finally:
         conn_check.close()
+
 
 @pytest.mark.usefixtures("clean_log", "setup_lock_table")
 def test_deadlock_log_search_path_with_user():
-    """
-    В лог должен попадать search_path с $user.
-    """
-    conn1 = make_conn()
-    conn2 = make_conn()
-
+    """В лог должен попадать search_path с $user."""
+    conn1, conn2 = make_conn(), make_conn()
     try:
         for conn in (conn1, conn2):
             setup_extension(conn, enabled=True, store_query=True, schema="public")
             with conn.cursor() as cur:
-                # на всякий случай schema, чтобы t_lock точно была видна
                 cur.execute("CREATE SCHEMA IF NOT EXISTS myschema;")
-                # используем $user в search_path
-                cur.execute("SET search_path = \"$user\", public, myschema;")
-                conn.commit()
-
-        all_exc = _make_deadlock(conn1, conn2)
-
-        assert all_exc, "Ожидали хотя бы одну ошибку из-за дедлока"
-        assert any(
-            isinstance(e, psycopg2.Error)
-            and getattr(e, "pgcode", None) == "40P01"
-            for e in all_exc
-        ), "Нет ошибки deadlock (40P01)"
+                cur.execute('SET search_path = "$user", public, myschema;')
+            conn.commit()
+        _assert_deadlock(_make_deadlock(conn1, conn2))
     finally:
         for conn in (conn1, conn2):
             try:
@@ -445,63 +307,36 @@ def test_deadlock_log_search_path_with_user():
             except Exception:
                 pass
 
-    # даём hook’у время
-    time.sleep(0.2)
+    assert wait_for_deadlock_log(PG_DSN)
 
     conn_check = psycopg2.connect(PG_DSN)
     conn_check.autocommit = True
     try:
         with conn_check.cursor() as cur:
-            # что реально видит проверочная сессия
-            cur.execute("SHOW search_path;")
-            actual_sp_check, = cur.fetchone()
-
-            # последняя запись из лога
             cur.execute("""
-                SELECT search_path
-                  FROM public.pg_deadlock_log
-              ORDER BY id DESC
-                 LIMIT 1;
+                SELECT search_path FROM public.pg_deadlock_log ORDER BY id DESC LIMIT 1;
             """)
             row = cur.fetchone()
-
-        assert row is not None, "Запись о дедлоке не найдена в pg_deadlock_log"
+        assert row is not None
         logged_sp, = row
-
-        # В логе должен быть тот же текст, который даёт SHOW search_path в сессии-жертве.
-        # Здесь уместны базовые ожидания:
-        assert "$user" in logged_sp or "pg_user" in logged_sp or "public" in logged_sp, (
-            f"search_path в логе выглядит странно: {logged_sp!r}"
-        )
+        assert "$user" in logged_sp or "public" in logged_sp, \
+            f"search_path выглядит странно: {logged_sp!r}"
     finally:
         conn_check.close()
+
 
 @pytest.mark.usefixtures("clean_log", "setup_lock_table")
 def test_deadlock_log_search_path_with_quotes():
-    """
-    В лог должен попадать search_path с кавычками и спецсимволами.
-    """
-    conn1 = make_conn()
-    conn2 = make_conn()
-
+    """В лог должен попадать search_path со спецсимволами."""
+    conn1, conn2 = make_conn(), make_conn()
     try:
         for conn in (conn1, conn2):
             setup_extension(conn, enabled=True, store_query=True, schema="public")
             with conn.cursor() as cur:
-
-                cur.execute("CREATE SCHEMA IF NOT EXISTS \"My.Schema\";")
-                # search_path с экранированным именем схемы
-                cur.execute("SET search_path = \"My.Schema\", public;")
-                conn.commit()
-
-        all_exc = _make_deadlock(conn1, conn2)
-
-        assert all_exc, "Ожидали хотя бы одну ошибку из-за дедлока"
-        assert any(
-            isinstance(e, psycopg2.Error)
-            and getattr(e, "pgcode", None) == "40P01"
-            for e in all_exc
-        ), "Нет ошибки deadlock (40P01)"
+                cur.execute('CREATE SCHEMA IF NOT EXISTS "My.Schema";')
+                cur.execute('SET search_path = "My.Schema", public;')
+            conn.commit()
+        _assert_deadlock(_make_deadlock(conn1, conn2))
     finally:
         for conn in (conn1, conn2):
             try:
@@ -509,84 +344,102 @@ def test_deadlock_log_search_path_with_quotes():
             except Exception:
                 pass
 
-    time.sleep(0.2)
+    assert wait_for_deadlock_log(PG_DSN)
 
     conn_check = psycopg2.connect(PG_DSN)
     conn_check.autocommit = True
     try:
         with conn_check.cursor() as cur:
             cur.execute("""
-                SELECT search_path
-                  FROM public.pg_deadlock_log
-              ORDER BY id DESC
-                 LIMIT 1;
+                SELECT search_path FROM public.pg_deadlock_log ORDER BY id DESC LIMIT 1;
             """)
             row = cur.fetchone()
-
-        assert row is not None, "Запись о дедлоке не найдена в pg_deadlock_log"
+        assert row is not None
         logged_sp, = row
-
-        assert "My.Schema" in logged_sp, (
-            f"Ожидали, что search_path содержит 'My.Schema', получили: {logged_sp!r}"
-        )
+        assert "My.Schema" in logged_sp, \
+            f"Ожидали 'My.Schema' в search_path, получили: {logged_sp!r}"
     finally:
         conn_check.close()
 
+
 @pytest.mark.usefixtures("clean_log", "setup_lock_table")
 def test_deadlock_log_xid_and_virtualxid_present():
-    """
-    В лог должны попадать xid и virtualxid жертвы дедлока.
-    """
-    conn1 = make_conn()
-    conn2 = make_conn()
-
+    """xid и virtualxid жертвы должны попадать в лог."""
+    conn1, conn2 = make_conn(), make_conn()
     try:
         for conn in (conn1, conn2):
             setup_extension(conn, enabled=True, store_query=True, schema="public")
-
-        all_exc = _make_deadlock(conn1, conn2)
-
-        assert all_exc, "Ожидали хотя бы одну ошибку из-за дедлока"
-        assert any(
-            isinstance(e, psycopg2.Error)
-            and getattr(e, "pgcode", None) == "40P01"
-            for e in all_exc
-        ), "Нет ошибки deadlock (40P01)"
+        _assert_deadlock(_make_deadlock(conn1, conn2))
     finally:
-        for c in (conn1, conn2):
+        for conn in (conn1, conn2):
             try:
-                c.close()
+                conn.close()
             except Exception:
                 pass
 
-    # Даём hook'у время записать лог
-    time.sleep(0.2)
+    assert wait_for_deadlock_log(PG_DSN)
 
     conn_check = psycopg2.connect(PG_DSN)
     conn_check.autocommit = True
     try:
         with conn_check.cursor() as cur:
             cur.execute("""
-                SELECT xid, virtualxid
-                  FROM public.pg_deadlock_log
-              ORDER BY id DESC
-                 LIMIT 1;
+                SELECT xid, virtualxid FROM public.pg_deadlock_log ORDER BY id DESC LIMIT 1;
             """)
             row = cur.fetchone()
-
-        assert row is not None, "Запись о дедлоке не найдена в pg_deadlock_log"
+        assert row is not None
         xid, virtualxid = row
-
-        # xid может быть NULL, если XID ещё не назначен, поэтому только мягкая проверка типа
         if xid is not None:
-            assert isinstance(xid, int), f"Ожидали целочисленный xid, получили {xid!r}"
-
-        # virtualxid должен быть непустой строкой разумного формата
-        assert virtualxid is not None and virtualxid != "", (
+            assert isinstance(xid, int), f"xid не int: {xid!r}"
+        assert virtualxid not in (None, ""), \
             f"Ожидали непустой virtualxid, получили: {virtualxid!r}"
-        )
-        assert "/" in virtualxid, (
-            f"Ожидали формат 'backendId/localXid' для virtualxid, получили: {virtualxid!r}"
-        )
+        assert "/" in virtualxid, \
+            f"Ожидали формат 'procNumber/lxid', получили: {virtualxid!r}"
+    finally:
+        conn_check.close()
+
+
+@pytest.mark.usefixtures("clean_log", "setup_lock_table")
+def test_deadlock_log_all_pids_and_lock_cycle():
+    """
+    all_pids должен содержать PID обоих участников дедлока.
+    lock_cycle должен содержать граф в формате 'X waits for Y'.
+    """
+    conn1, conn2 = make_conn(), make_conn()
+    try:
+        for conn in (conn1, conn2):
+            setup_extension(conn, enabled=True, store_query=True, schema="public")
+        all_exc, pid1, pid2, _ = _make_deadlock_with_pids(conn1, conn2)
+        _assert_deadlock(all_exc)
+    finally:
+        for conn in (conn1, conn2):
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    assert wait_for_deadlock_log(PG_DSN)
+
+    conn_check = psycopg2.connect(PG_DSN)
+    conn_check.autocommit = True
+    try:
+        with conn_check.cursor() as cur:
+            cur.execute("""
+                SELECT all_pids, lock_cycle FROM public.pg_deadlock_log ORDER BY id DESC LIMIT 1;
+            """)
+            row = cur.fetchone()
+        assert row is not None
+        all_pids, lock_cycle = row
+
+        assert all_pids is not None and len(all_pids) >= 2, \
+            f"Ожидали >= 2 PID в all_pids, получили: {all_pids!r}"
+        assert pid1 in all_pids, f"pid1={pid1} не найден в all_pids={all_pids}"
+        assert pid2 in all_pids, f"pid2={pid2} не найден в all_pids={all_pids}"
+
+        assert lock_cycle not in (None, ""), "Ожидали непустой lock_cycle"
+        assert "waits for" in lock_cycle, \
+            f"lock_cycle не содержит 'waits for': {lock_cycle!r}"
+        assert str(pid1) in lock_cycle, f"pid1={pid1} не в lock_cycle: {lock_cycle!r}"
+        assert str(pid2) in lock_cycle, f"pid2={pid2} не в lock_cycle: {lock_cycle!r}"
     finally:
         conn_check.close()

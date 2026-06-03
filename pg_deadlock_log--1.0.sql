@@ -18,8 +18,11 @@ CREATE TABLE pg_deadlock_log (
 
     application_name text,                                  -- application_name жертвы, если доступен
     client_addr      text,                                  -- адрес клиента
-    search_path      text,                                   -- search_path жертвы
+    search_path      text,                                  -- search_path жертвы
 
     xid              bigint,                                -- текущий XID жертвы
-    virtualxid       text                                   -- virtual XID жертвы
+    virtualxid       text,                                  -- virtual XID жертвы
+
+    all_pids         integer[]    NOT NULL DEFAULT '{}',    -- PID всех участников дедлока
+    lock_cycle       text                                   -- граф блокировок: "X waits for Y; Y waits for Z"
 );

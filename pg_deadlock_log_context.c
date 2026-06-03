@@ -4,6 +4,8 @@
 #include "executor/spi.h"
 #include "libpq/libpq-be.h"
 #include "miscadmin.h"
+#include "storage/lock.h"
+#include "storage/lmgr.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
 #include "storage/predicate.h"
@@ -15,35 +17,123 @@
 
 #include "pg_deadlock_log_internal.h"
 
+/* Временное объявление EDGE для каста */
+/* В реальности определяется в deadlock.c */
+typedef struct EDGE
+{
+    PGPROC *waiter;
+    PGPROC *blocker;
+    LOCK   *lock;
+    int     pred;
+    int     ink;
+} EDGE;
+
 extern const char *debug_query_string;
 
 /*
- * Часть данных из ErrorData и глобального состояния backend'а.
+ * Заполнение полей из DeadlockInfo.
  */
-void pg_deadlock_log_fill_from_errordata(ErrorData *edata, DeadlockLogEntry *entry)
+void
+pg_deadlock_log_fill_from_deadlockinfo(const DeadlockInfo *info,
+                                       DeadlockLogEntry *entry)
 {
-    entry->query_str = NULL;
-    entry->error_msg = NULL;
-    entry->error_detail = NULL;
-    entry->sqlstate_str = NULL;
-    entry->app_name = NULL;
-    entry->client_addr_str = NULL;
+    /* Основная информация из DeadlockInfo */
+    entry->victim_pid   = info->victim_proc ? info->victim_proc->pid : 0;
+    entry->occurred_at  = info->snapshot_time;
 
-    if (pg_deadlock_log_store_query && debug_query_string)
-        entry->query_str = debug_query_string;
+    /* Пока оставляем NULL — заполняются из других источников */
+    entry->query_str        = NULL;
+    entry->error_msg        = NULL;
+    entry->error_detail     = NULL;
+    entry->sqlstate_str     = "40P01";     /* дедлок — всегда 40P01 */
+    entry->app_name         = NULL;
+    entry->client_addr_str  = NULL;
 
-    if (edata != NULL)
-    {
-        if (edata->message)
-            entry->error_msg = edata->message;
-        if (edata->detail)
-            entry->error_detail = edata->detail;
-        if (edata->sqlerrcode)
-            entry->sqlstate_str = unpack_sql_state(edata->sqlerrcode);
-    }
-
+    /* client_addr из MyProcPort (контекст жертвы — текущий backend) */
     if (MyProcPort && MyProcPort->remote_host && MyProcPort->remote_host[0] != '\0')
         entry->client_addr_str = MyProcPort->remote_host;
+}
+
+/*
+ * Извлекает PID всех участников дедлока из DeadlockInfo.
+ */
+void
+pg_deadlock_log_fill_participants(const DeadlockInfo *info,
+                                  DeadlockLogEntry *entry)
+{
+    entry->all_pids   = NULL;
+    entry->n_all_pids = 0;
+
+    if (info == NULL || info->n_procs <= 0 || info->all_procs == NULL)
+        return;
+
+    /* Выделяем массив под PID */
+    entry->all_pids = (int *) palloc(info->n_procs * sizeof(int));
+    entry->n_all_pids = info->n_procs;
+
+    /* Заполняем PID из PGPROC */
+    for (int i = 0; i < info->n_procs; i++)
+    {
+        if (info->all_procs[i] != NULL)
+            entry->all_pids[i] = info->all_procs[i]->pid;
+        else
+            entry->all_pids[i] = 0;
+    }
+}
+
+/*
+ * Строит текстовое описание графа блокировок.
+ * Формат: "X waits for Y on <lockdesc>; Y waits for Z on <lockdesc>"
+ */
+void
+pg_deadlock_log_fill_lock_cycle(const DeadlockInfo *info,
+                                DeadlockLogEntry *entry)
+{
+    StringInfoData buf;
+    int            i;
+
+    entry->lock_cycle = NULL;
+
+    if (info == NULL || info->n_procs <= 0 || info->all_procs == NULL)
+        return;
+
+    initStringInfo(&buf);
+
+    /* Строим цикл из all_procs: каждый ждёт следующего */
+    for (i = 0; i < info->n_procs; i++)
+    {
+        PGPROC *waiter  = info->all_procs[i];
+        PGPROC *blocker = info->all_procs[(i + 1) % info->n_procs];
+
+        int waiter_pid  = waiter  ? waiter->pid  : 0;
+        int blocker_pid = blocker ? blocker->pid : 0;
+
+        if (i > 0)
+            appendStringInfoString(&buf, "; ");
+
+        appendStringInfo(&buf, "%d waits for %d", waiter_pid, blocker_pid);
+    }
+
+    entry->lock_cycle = buf.data;
+    
+    elog(LOG, "pg_deadlock_log: lock_cycle built: %s", entry->lock_cycle);
+}
+
+/*
+ * Читает запросы участников через pg_stat_activity (SPI).
+ * Опционально — если нужны не только PID, но и запросы.
+ */
+void
+pg_deadlock_log_fill_participant_queries(const DeadlockInfo *info,
+                                         DeadlockLogEntry *entry)
+{
+    /* Пока заглушка */
+    /*
+     * Идея:
+     * 1. Построить список PID через SPI в строку: "1,2,3"
+     * 2. SELECT pid, query FROM pg_stat_activity WHERE pid = ANY(ARRAY[...])
+     * 3. Заполнить массив строк в entry->all_queries[]
+     */
 }
 
 /*
@@ -52,8 +142,7 @@ void pg_deadlock_log_fill_from_errordata(ErrorData *edata, DeadlockLogEntry *ent
 void pg_deadlock_log_fill_tx_info(DeadlockLogEntry *entry)
 {
     TransactionId xid;
-    VirtualTransactionId vxid;
-
+    
     entry->schema = pg_deadlock_log_schema;
     entry->search_path_str = NULL;
     entry->xid_str = NULL;
@@ -79,18 +168,13 @@ void pg_deadlock_log_fill_tx_info(DeadlockLogEntry *entry)
     if (TransactionIdIsValid(xid))
         entry->xid_str = psprintf("%u", xid);
 
-    /* virtualxid */
-    vxid.backendId = InvalidBackendId;
-    vxid.localTransactionId = InvalidLocalTransactionId;
-
+    /* virtualxid — в этой версии PG используется procNumber, а не backendId */
     if (MyProc != NULL)
     {
-        vxid.backendId = MyProc->backendId;
-        vxid.localTransactionId = MyProc->lxid;
+        entry->vxid_str = psprintf("%d/%u",
+                                   MyProc->vxid.procNumber,
+                                   MyProc->vxid.lxid);
     }
-
-    if (VirtualTransactionIdIsValid(vxid))
-        entry->vxid_str = psprintf("%d/%u", vxid.backendId, vxid.localTransactionId);
 
     if (entry->schema == NULL || entry->schema[0] == '\0')
         entry->schema = "public";
@@ -98,58 +182,12 @@ void pg_deadlock_log_fill_tx_info(DeadlockLogEntry *entry)
 
 /*
  * Метаданные через SPI: current_database, current_user, application_name.
+ * Заглушка, SPI в хуке - не безопасно.
  */
 bool pg_deadlock_log_fill_metadata_via_spi(DeadlockLogEntry *entry)
 {
-    int ret;
-    char *app_name_sql = NULL;
-
     entry->db_name = NULL;
     entry->user_name = NULL;
     entry->app_name = NULL;
-
-    AbortOutOfAnyTransaction();
-    StartTransactionCommand();
-    PushActiveSnapshot(GetTransactionSnapshot());
-
-    if (SPI_connect() != SPI_OK_CONNECT)
-    {
-        elog(WARNING, "pg_deadlock_log: SPI_connect failed in hook (metadata phase)");
-        PopActiveSnapshot();
-        AbortCurrentTransaction();
-        return false;
-    }
-
-    /* database_name */
-    ret = SPI_execute("SELECT current_database()", true, 1);
-    if (ret == SPI_OK_SELECT && SPI_processed > 0)
-        entry->db_name = SPI_getvalue(SPI_tuptable->vals[0],
-                                      SPI_tuptable->tupdesc,
-                                      1);
-    if (entry->db_name == NULL)
-        entry->db_name = "<unknown_db>";
-
-    /* user_name */
-    ret = SPI_execute("SELECT current_user", true, 1);
-    if (ret == SPI_OK_SELECT && SPI_processed > 0)
-        entry->user_name = SPI_getvalue(SPI_tuptable->vals[0],
-                                        SPI_tuptable->tupdesc,
-                                        1);
-    if (entry->user_name == NULL)
-        entry->user_name = "<unknown_user>";
-
-    /* application_name */
-    ret = SPI_execute("SELECT current_setting('application_name', true)", true, 1);
-    if (ret == SPI_OK_SELECT && SPI_processed > 0)
-        app_name_sql = SPI_getvalue(SPI_tuptable->vals[0],
-                                    SPI_tuptable->tupdesc,
-                                    1);
-    if (app_name_sql != NULL && app_name_sql[0] != '\0')
-        entry->app_name = app_name_sql;
-
-    SPI_finish();
-    PopActiveSnapshot();
-    CommitTransactionCommand();
-
     return true;
 }
