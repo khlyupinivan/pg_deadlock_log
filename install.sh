@@ -66,27 +66,20 @@ log_info "EXT_DIR    : ${EXT_DIR}"
 log_info "TARGET_DB  : ${TARGET_DB}"
 
 # -----------------------------------------------------------------------------
-# Шаг 1: Применяем патчи к исходникам PG
+# Шаг 1: Копируем изменённые файлы ядра PG
 # -----------------------------------------------------------------------------
-PATCH_DIR="${EXT_DIR}/patches"
-if [[ -d "$PATCH_DIR" ]]; then
-    log_info "Applying patches from ${PATCH_DIR}..."
-    for patch_file in "${PATCH_DIR}"/*.patch; do
-        [[ -f "$patch_file" ]] || continue
-        log_info "  Applying: $(basename "$patch_file")"
-        patch -d "$PG_SRC" -p1 --forward --reject-file=/tmp/patch.rej < "$patch_file" || {
-            if grep -q "already applied" /tmp/patch.rej 2>/dev/null; then
-                log_warn "  Already applied, skipping"
-            else
-                log_error "  Failed to apply: $patch_file"
-                cat /tmp/patch.rej 2>/dev/null || true
-                exit 1
-            fi
-        }
-    done
-else
-    log_warn "No patches directory at ${PATCH_DIR}, skipping"
-fi
+log_info "Copying patched PostgreSQL source files..."
+
+PATCHED_DEADLOCK="${EXT_DIR}/postgres/src/backend/storage/lmgr/deadlock.c"
+PATCHED_LOCK_H="${EXT_DIR}/postgres/src/include/storage/lock.h"
+
+[[ -f "$PATCHED_DEADLOCK" ]] || { log_error "Patched file not found: $PATCHED_DEADLOCK"; exit 1; }
+[[ -f "$PATCHED_LOCK_H"   ]] || { log_error "Patched file not found: $PATCHED_LOCK_H";   exit 1; }
+
+cp "$PATCHED_DEADLOCK" "${PG_SRC}/src/backend/storage/lmgr/deadlock.c"
+cp "$PATCHED_LOCK_H"   "${PG_SRC}/src/include/storage/lock.h"
+
+log_info "Patched files copied successfully"
 
 # -----------------------------------------------------------------------------
 # Шаг 2: Пересобираем PG (патч мог затронуть заголовки)
