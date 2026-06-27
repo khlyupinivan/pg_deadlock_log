@@ -1,194 +1,131 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+# =============================================================================
+# install.sh — установка расширения pg_deadlock_log
+# Запускается от пользователя postgres
+# =============================================================================
+set -euo pipefail
 
-# ============================================================
-# deploy_pg_deadlock_log.sh
-# Использование:
-#   ./deploy_pg_deadlock_log.sh \
-#     --pg-src /path/to/postgresql-source \
-#     --db-name mydb \
-#     [--pg-user postgres] \
-#     [--clone-dir /tmp/pg_deadlock_log]
-# ============================================================
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
 
-# --- Значения по умолчанию ---
-PG_USER="postgres"
-CLONE_DIR="/tmp/pg_deadlock_log"
-DB_NAME=""
+log_info()  { echo -e "${GREEN}[INFO]${NC}  $*"; }
+log_warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
+
+# -----------------------------------------------------------------------------
+# Аргументы
+# -----------------------------------------------------------------------------
 PG_SRC=""
-REPO_URL="https://github.com/khlyupinivan/pg_deadlock_log.git"
+EXT_DIR=""
+PG_DATA=""
+TARGET_DB="postgres"
 
-# --- Парсинг аргументов ---
+usage() {
+    echo "Usage: $0 --pg-src <path> --ext-dir <path> --pg-data <path> [--db <dbname>]"
+    exit 1
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --pg-src)    PG_SRC="$2";    shift 2 ;;
-        --db-name)   DB_NAME="$2";   shift 2 ;;
-        --pg-user)   PG_USER="$2";   shift 2 ;;
-        --clone-dir) CLONE_DIR="$2"; shift 2 ;;
-        *)
-            echo "Неизвестный параметр: $1"
-            echo "Использование: $0 --pg-src <путь> --db-name <бд> [--pg-user postgres] [--clone-dir /tmp/pg_deadlock_log]"
-            exit 1
-            ;;
+        --pg-src)   PG_SRC="$2";    shift 2 ;;
+        --ext-dir)  EXT_DIR="$2";   shift 2 ;;
+        --pg-data)  PG_DATA="$2";   shift 2 ;;
+        --db)       TARGET_DB="$2"; shift 2 ;;
+        *) log_error "Unknown argument: $1"; usage ;;
     esac
 done
 
-# --- Проверка обязательных параметров ---
-if [[ -z "$PG_SRC" ]]; then
-    echo "Ошибка: не указан --pg-src (путь к исходникам PostgreSQL)"
-    exit 1
-fi
-if [[ -z "$DB_NAME" ]]; then
-    echo "Ошибка: не указан --db-name (имя базы данных)"
-    exit 1
-fi
-if [[ ! -d "$PG_SRC" ]]; then
-    echo "Ошибка: директория исходников PostgreSQL не найдена: $PG_SRC"
-    exit 1
-fi
+# -----------------------------------------------------------------------------
+# Валидация
+# -----------------------------------------------------------------------------
+[[ -z "$PG_SRC"  ]] && { log_error "--pg-src is required";  usage; }
+[[ -z "$EXT_DIR" ]] && { log_error "--ext-dir is required"; usage; }
+[[ -z "$PG_DATA" ]] && { log_error "--pg-data is required"; usage; }
 
-# --- Пути ---
-PG_BIN=$(pg_config --bindir)
-PG_LIB=$(pg_config --pkglibdir)
-PG_SHARE=$(pg_config --sharedir)
-PG_DATA=$(psql -U "$PG_USER" -tAc "SHOW data_directory;")
-PG_CONF="$PG_DATA/postgresql.conf"
+[[ -d "$PG_SRC"  ]] || { log_error "PG_SRC not found: $PG_SRC";   exit 1; }
+[[ -d "$EXT_DIR" ]] || { log_error "EXT_DIR not found: $EXT_DIR"; exit 1; }
+[[ -d "$PG_DATA" ]] || { log_error "PG_DATA not found: $PG_DATA"; exit 1; }
 
-echo "=== Параметры развёртки ==="
-echo "  PG_SRC    : $PG_SRC"
-echo "  PG_BIN    : $PG_BIN"
-echo "  PG_LIB    : $PG_LIB"
-echo "  PG_SHARE  : $PG_SHARE"
-echo "  PG_DATA   : $PG_DATA"
-echo "  DB_NAME   : $DB_NAME"
-echo "  PG_USER   : $PG_USER"
-echo "  CLONE_DIR : $CLONE_DIR"
-echo ""
+# -----------------------------------------------------------------------------
+# pg_config
+# -----------------------------------------------------------------------------
+PG_CONFIG=$(command -v pg_config || true)
+[[ -z "$PG_CONFIG" ]] && { log_error "pg_config not found in PATH (${PATH})"; exit 1; }
 
-# ============================================================
-# ШАГ 1: Клонирование репозитория
-# ============================================================
-echo "=== Шаг 1: Клонирование репозитория ==="
+PG_SHAREDIR=$("$PG_CONFIG" --sharedir)
+PG_PKGLIBDIR=$("$PG_CONFIG" --pkglibdir)
+PG_VERSION=$("$PG_CONFIG" --version)
 
-if [[ -d "$CLONE_DIR" ]]; then
-    echo "Директория $CLONE_DIR уже существует — обновляем..."
-    cd "$CLONE_DIR"
-    git pull origin main
+log_info "PostgreSQL : ${PG_VERSION}"
+log_info "sharedir   : ${PG_SHAREDIR}"
+log_info "pkglibdir  : ${PG_PKGLIBDIR}"
+log_info "PG_SRC     : ${PG_SRC}"
+log_info "EXT_DIR    : ${EXT_DIR}"
+log_info "TARGET_DB  : ${TARGET_DB}"
+
+# -----------------------------------------------------------------------------
+# Шаг 1: Применяем патчи к исходникам PG
+# -----------------------------------------------------------------------------
+PATCH_DIR="${EXT_DIR}/patches"
+if [[ -d "$PATCH_DIR" ]]; then
+    log_info "Applying patches from ${PATCH_DIR}..."
+    for patch_file in "${PATCH_DIR}"/*.patch; do
+        [[ -f "$patch_file" ]] || continue
+        log_info "  Applying: $(basename "$patch_file")"
+        patch -d "$PG_SRC" -p1 --forward --reject-file=/tmp/patch.rej < "$patch_file" || {
+            if grep -q "already applied" /tmp/patch.rej 2>/dev/null; then
+                log_warn "  Already applied, skipping"
+            else
+                log_error "  Failed to apply: $patch_file"
+                cat /tmp/patch.rej 2>/dev/null || true
+                exit 1
+            fi
+        }
+    done
 else
-    git clone "$REPO_URL" "$CLONE_DIR"
-    cd "$CLONE_DIR"
+    log_warn "No patches directory at ${PATCH_DIR}, skipping"
 fi
 
-# ============================================================
-# ШАГ 2: Замена файлов ядра PostgreSQL
-# ============================================================
-echo ""
-echo "=== Шаг 2: Замена файлов ядра PostgreSQL ==="
+# -----------------------------------------------------------------------------
+# Шаг 2: Пересобираем PG (патч мог затронуть заголовки)
+# -----------------------------------------------------------------------------
+log_info "Rebuilding PostgreSQL after patch..."
+make -C "$PG_SRC" -j"$(nproc)"
+make -C "$PG_SRC" install
+log_info "PostgreSQL rebuild complete"
 
-DEADLOCK_C_SRC="$CLONE_DIR/postgres/src/backend/storage/lmgr/deadlock.c"
-LOCK_H_SRC="$CLONE_DIR/postgres/src/include/storage/lock.h"
+# -----------------------------------------------------------------------------
+# Шаг 3: Собираем и устанавливаем расширение
+# -----------------------------------------------------------------------------
+log_info "Building extension..."
+make -C "$EXT_DIR" PG_CONFIG="$PG_CONFIG"
+make -C "$EXT_DIR" PG_CONFIG="$PG_CONFIG" install
+log_info "Extension installed"
 
-DEADLOCK_C_DST="$PG_SRC/src/backend/storage/lmgr/deadlock.c"
-LOCK_H_DST="$PG_SRC/src/include/storage/lock.h"
+# -----------------------------------------------------------------------------
+# Шаг 4: shared_preload_libraries
+# -----------------------------------------------------------------------------
+PG_CONF="${PG_DATA}/postgresql.conf"
 
-# Бэкап оригиналов (только если бэкап ещё не делался)
-if [[ ! -f "${DEADLOCK_C_DST}.orig" ]]; then
-    echo "Бэкап: $DEADLOCK_C_DST -> ${DEADLOCK_C_DST}.orig"
-    cp "$DEADLOCK_C_DST" "${DEADLOCK_C_DST}.orig"
-fi
-if [[ ! -f "${LOCK_H_DST}.orig" ]]; then
-    echo "Бэкап: $LOCK_H_DST -> ${LOCK_H_DST}.orig"
-    cp "$LOCK_H_DST" "${LOCK_H_DST}.orig"
-fi
-
-# Копирование изменённых файлов
-echo "Копируем deadlock.c..."
-cp "$DEADLOCK_C_SRC" "$DEADLOCK_C_DST"
-
-echo "Копируем lock.h..."
-cp "$LOCK_H_SRC" "$LOCK_H_DST"
-
-# ============================================================
-# ШАГ 3: Пересборка модуля lmgr
-# ============================================================
-echo ""
-echo "=== Шаг 3: Пересборка модуля lmgr ==="
-
-cd "$PG_SRC"
-make -C src/backend/storage/lmgr
-make -C src/backend/storage/lmgr install
-
-# ============================================================
-# ШАГ 4: Остановка PostgreSQL
-# ============================================================
-echo ""
-echo "=== Шаг 4: Остановка PostgreSQL ==="
-
-"$PG_BIN/pg_ctl" stop -D "$PG_DATA" -m fast
-echo "PostgreSQL остановлен."
-
-# ============================================================
-# ШАГ 5: Компиляция и установка расширения
-# ============================================================
-echo ""
-echo "=== Шаг 5: Компиляция и установка расширения ==="
-
-cd "$CLONE_DIR"
-make USE_PGXS=1
-make USE_PGXS=1 install
-
-echo "Расширение установлено:"
-echo "  $PG_LIB/pg_deadlock_log.so"
-echo "  $PG_SHARE/extension/pg_deadlock_log.control"
-
-# ============================================================
-# ШАГ 6: Добавление в shared_preload_libraries
-# ============================================================
-echo ""
-echo "=== Шаг 6: Настройка shared_preload_libraries ==="
-
-# Читаем текущее значение (убираем комментарии и пробелы)
-CURRENT_SPL=$(grep -E "^\s*shared_preload_libraries\s*=" "$PG_CONF" \
-    | tail -1 \
-    | sed "s/.*=\s*//; s/'//g; s/\"//g; s/#.*//" \
-    | tr -d ' ')
-
-if [[ -z "$CURRENT_SPL" ]]; then
-    # Параметра нет — добавляем строку
+if grep -q "^shared_preload_libraries" "$PG_CONF"; then
+    CURRENT=$(grep "^shared_preload_libraries" "$PG_CONF" \
+              | sed "s/shared_preload_libraries\s*=\s*['\"]//;s/['\"].*//")
+    if echo "$CURRENT" | grep -q "pg_deadlock_log"; then
+        log_warn "pg_deadlock_log already in shared_preload_libraries"
+    else
+        if [[ -z "$CURRENT" ]]; then
+            NEW_VAL="pg_deadlock_log"
+        else
+            NEW_VAL="${CURRENT},pg_deadlock_log"
+        fi
+        sed -i "s|^shared_preload_libraries.*|shared_preload_libraries = '${NEW_VAL}'|" "$PG_CONF"
+        log_info "shared_preload_libraries = '${NEW_VAL}'"
+    fi
+else
     echo "shared_preload_libraries = 'pg_deadlock_log'" >> "$PG_CONF"
-    echo "Добавлено: shared_preload_libraries = 'pg_deadlock_log'"
-elif echo "$CURRENT_SPL" | grep -q "pg_deadlock_log"; then
-    echo "pg_deadlock_log уже присутствует в shared_preload_libraries — пропускаем."
-else
-    # Есть другие расширения — дописываем через запятую
-    NEW_SPL="${CURRENT_SPL},pg_deadlock_log"
-    # Заменяем строку в конфиге
-    sed -i "s|^\s*shared_preload_libraries\s*=.*|shared_preload_libraries = '$NEW_SPL'|" "$PG_CONF"
-    echo "Обновлено: shared_preload_libraries = '$NEW_SPL'"
+    log_info "Added shared_preload_libraries = 'pg_deadlock_log'"
 fi
 
-# ============================================================
-# ШАГ 7: Запуск PostgreSQL
-# ============================================================
-echo ""
-echo "=== Шаг 7: Запуск PostgreSQL ==="
-
-"$PG_BIN/pg_ctl" start -D "$PG_DATA"
-echo "Ожидаем готовности PostgreSQL..."
-sleep 3
-
-# ============================================================
-# ШАГ 8: CREATE EXTENSION в целевой БД
-# ============================================================
-echo ""
-echo "=== Шаг 8: Создание расширения в базе '$DB_NAME' ==="
-
-psql -U "$PG_USER" -d "$DB_NAME" -c "CREATE EXTENSION IF NOT EXISTS pg_deadlock_log;"
-
-echo ""
-echo "=== Проверка ==="
-psql -U "$PG_USER" -d "$DB_NAME" -c "\dx pg_deadlock_log"
-psql -U "$PG_USER" -d "$DB_NAME" -c "SELECT COUNT(*) FROM pg_deadlock_log;"
-
-echo ""
-echo "=== Развёртка завершена успешно ==="
+log_info "install.sh done. Restart PostgreSQL to apply changes."
