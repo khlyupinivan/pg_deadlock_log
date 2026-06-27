@@ -3,6 +3,7 @@
 
 #include "postgres.h"
 #include "storage/lock.h"
+#include "storage/latch.h"
 #include "storage/lwlock.h"
 #include "utils/elog.h"
 
