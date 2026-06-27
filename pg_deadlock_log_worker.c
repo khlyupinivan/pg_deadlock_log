@@ -110,6 +110,10 @@ pg_deadlock_log_worker_main(Datum main_arg)
     }
     PG_END_TRY();
 
+    LWLockAcquire(&pg_deadlock_shm->lock, LW_EXCLUSIVE);
+    pg_deadlock_shm->worker_latch = MyLatch;
+    LWLockRelease(&pg_deadlock_shm->lock);
+
     elog(LOG, "pg_deadlock_log worker started");
 
     while (!got_sigterm)
@@ -173,5 +177,10 @@ pg_deadlock_log_worker_main(Datum main_arg)
     }
 
     elog(LOG, "pg_deadlock_log worker shutting down");
+    
+    LWLockAcquire(&pg_deadlock_shm->lock, LW_EXCLUSIVE);
+    pg_deadlock_shm->worker_latch = NULL;
+    LWLockRelease(&pg_deadlock_shm->lock);
+
     proc_exit(0);
 }

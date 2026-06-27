@@ -64,5 +64,8 @@ pg_deadlock_log_write_shm(const DeadlockLogEntry *entry)
 
     LWLockRelease(&shm->lock);
 
+    if (shm->worker_latch != NULL)
+        SetLatch(shm->worker_latch);
+
     elog(LOG, "pg_deadlock_log: written to shm, victim_pid=%d", entry->victim_pid);
 }

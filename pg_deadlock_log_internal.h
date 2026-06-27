@@ -26,6 +26,7 @@ typedef struct DeadlockLogShm
 {
     LWLock  lock;
     bool    pending;
+    Latch  *worker_latch;
 
     int     victim_pid;
     int     all_pids[DEADLOCK_MAX_PIDS];
