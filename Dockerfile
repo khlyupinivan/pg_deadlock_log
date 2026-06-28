@@ -7,6 +7,7 @@ FROM ubuntu:24.04
 ARG PG_GIT_REF=REL_17_5
 ARG TARGET_DB=postgres
 ARG EXT_REPO=https://github.com/khlyupinivan/pg_deadlock_log.git
+ARG EXT_BRANCH=pg17-support
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PG_INSTALL_DIR=/usr/local/pgsql
@@ -69,7 +70,7 @@ RUN gosu postgres bash -c " \
 # -----------------------------------------------------------------------------
 # 5. Клонируем расширение pg_deadlock_log
 # -----------------------------------------------------------------------------
-RUN git clone ${EXT_REPO} /pg_deadlock_log \
+RUN git clone --branch ${EXT_BRANCH} ${EXT_REPO} /pg_deadlock_log \
     && chown -R postgres:postgres /pg_deadlock_log
 
 # -----------------------------------------------------------------------------
