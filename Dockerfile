@@ -1,10 +1,10 @@
 # =============================================================================
-# Dockerfile — сборка PostgreSQL master + расширение pg_deadlock_log
-# PostgreSQL commit: a272a58b94249879c3f7e170a5ebfaeec940d411
+# Dockerfile — сборка PostgreSQL REL_17_5 + расширение pg_deadlock_log
+# PostgreSQL commit: REL_17_5
 # =============================================================================
 FROM ubuntu:24.04
 
-ARG PG_GIT_REF=a272a58b94249879c3f7e170a5ebfaeec940d411
+ARG PG_GIT_REF=REL_17_5
 ARG TARGET_DB=postgres
 ARG EXT_REPO=https://github.com/khlyupinivan/pg_deadlock_log.git
 
