@@ -1,0 +1,49 @@
+=== SETUP ===
+  Таблица bench_test создана (10000 строк)
+
+=== БЕНЧМАРК OVERHEAD pg_deadlock_log ===
+  Прогрев: 2000 ops, Замер: 50000 ops
+
+--- Simple UPDATE (100 раундов × 500 ops) ---
+  pg_deadlock_log enabled :
+    mean=1.220ms  median=1.114ms  p95=1.762ms  p99=2.614ms
+    min=0.835ms  max=16.002ms  stdev=0.409ms
+  pg_deadlock_log disabled:
+    mean=1.236ms  median=1.123ms  p95=1.822ms  p99=2.688ms
+    min=0.827ms  max=17.952ms  stdev=0.444ms
+  Разница (enabled vs disabled):
+    mean    : -0.016ms  (-1.3%)  ✓
+    median  : -0.008ms  (-0.7%)  ✓
+    p95     : -0.059ms  (-3.2%)  ✓
+    p99     : -0.073ms  (-2.7%)  ✓
+
+--- SELECT (read-only) (100 раундов × 500 ops) ---
+  pg_deadlock_log enabled :
+    mean=0.490ms  median=0.450ms  p95=0.707ms  p99=1.154ms
+    min=0.301ms  max=14.898ms  stdev=0.179ms
+  pg_deadlock_log disabled:
+    mean=0.507ms  median=0.453ms  p95=0.775ms  p99=1.420ms
+    min=0.314ms  max=12.370ms  stdev=0.242ms
+  Разница (enabled vs disabled):
+    mean    : -0.017ms  (-3.3%)  ✓
+    median  : -0.003ms  (-0.7%)  ✓
+    p95     : -0.068ms  (-8.8%)  ✓
+    p99     : -0.266ms  (-18.7%)  ✓
+
+--- Multi UPDATE (3x) (100 раундов × 500 ops) ---
+  pg_deadlock_log enabled :
+    mean=2.251ms  median=2.056ms  p95=3.360ms  p99=4.726ms
+    min=1.444ms  max=22.018ms  stdev=0.694ms
+  pg_deadlock_log disabled:
+    mean=2.268ms  median=2.072ms  p95=3.392ms  p99=4.764ms
+    min=1.468ms  max=25.469ms  stdev=0.688ms
+  Разница (enabled vs disabled):
+    mean    : -0.017ms  (-0.7%)  ✓
+    median  : -0.016ms  (-0.8%)  ✓
+    p95     : -0.032ms  (-0.9%)  ✓
+    p99     : -0.037ms  (-0.8%)  ✓
+
+=== ИТОГ ===
+  ✓ Overhead в пределах погрешности (<10%) — production-safe
+
+  Порог 10% условный — результаты зависят от железа и окружения.

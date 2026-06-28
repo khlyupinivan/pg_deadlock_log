@@ -1194,4 +1194,24 @@ RememberSimpleDeadLock(PGPROC *proc1,
 	info->lockmode = proc2->waitLockMode;
 	info->pid = proc2->pid;
 	nDeadlockDetails = 2;
+
+	if (deadlock_log_hook != NULL)
+	{
+		DeadlockInfo	dinfo;
+		PGPROC		   *simple_procs[2];
+
+		simple_procs[0] = proc1;
+		simple_procs[1] = proc2;
+
+		dinfo.victim_proc	= proc1;
+		dinfo.all_procs		= simple_procs;
+		dinfo.n_procs		= 2;
+		dinfo.cycle_edges	= NULL;
+		dinfo.n_cycle_edges	= 0;
+		dinfo.locks			= NULL;
+		dinfo.n_locks		= 0;
+		dinfo.snapshot_time	= GetCurrentTimestamp();
+
+		deadlock_log_hook(&dinfo);
+	}
 }

@@ -15,16 +15,22 @@ pg_deadlock_log — расширение PostgreSQL, которое перехв
     7.	текущий xid и virtualxid жертвы;
 	8.  all_pids; 
 	9.  lock_cycle в формате "X waits for Y; Y waits for Z".
-3.	Минимальное вмешательство в остальной код:
+3. Автоматическая ротация записей через GUC-параметры TTL и лимит строк.
+4.	Минимальное вмешательство в остальной код:
     1.	работает через deadlock_log_hook;
-    2.	аккуратно вызывает прежний хук, если он был.
+    2.	аккуратно вызывает прежний хук, если он был;
+	3. Основная работа выполняется в расширении
 
 ## Установка
 ### 1.	Сборка и установка
-В каталоге с исходниками:
-```bash
-make && sudo make install $$ sudo service postgresql restart
-```
+./install.sh \
+    --pg-src /path/to/postgres \
+    --ext-dir /path/to/pg_deadlock_log \
+    --pg-data /var/lib/postgresql/data \
+    --db postgres
+
+Затем в БД:
+CREATE EXTENSION pg_deadlock_log;
 
 Требования:
 1.	PostgreSQL, собранный с поддержкой модулей C;
@@ -75,7 +81,7 @@ lock_cycle       text                                 -- граф блокиро
 
 # Настройки (GUC параметры)
 
-Расширение определяет четыре GUC параметра.
+Расширение определяет шесть GUC параметров.
 
 ## pg_deadlock_log.enabled (boolean)
 
@@ -136,6 +142,24 @@ CREATE SCHEMA IF NOT EXISTS monitoring; ALTER TABLE public.pg_deadlock_log SET S
 
 Значение по умолчанию: 50000
 
+## retention_days (int)
+Количество дней, которые данные хранятся в таблице
+
+Тип: int
+
+Уровень: SUSET
+
+Значение по умолчанию: 30
+
+## max_records (int)
+Количество записей, хранимых в таблице
+
+Тип: int
+
+Уровень: SUSET
+
+Значение по умолчанию: 10000
+
 # Как это работает внутри
 
 ## Хук на deadlock_log_hook
@@ -174,27 +198,20 @@ pg_deadlock_log_write_shm захватывает LWLock, копирует дан
 2.	Тем не менее, вставка идёт через SPI и запускает свои внутренние транзакции, что вносит небольшой overhead в момент дедлока.
 3.	Вся логика обёрнута в PG_TRY/PG_CATCH и не должна ломать основной поток обработки ошибок.
 
+## Освобождение таблицы
+
+SELECT pg_deadlock_log_vacuum();
+
+Удаляет записи старше retention_days и сверх лимита max_records.
+
+## Тестирование
+6 сценариев: row-level lock, table-level lock, advisory lock, multi-row, multi-process, store_query off.
+
+Имеется проверка benchmark_overhead. Результаты можно посмотреть в файле: ./tests/benchmark_overhead_result.txt
+
 ## Рекомендации:
 1.	Не использовать в проде без тестирования под своей нагрузкой.
 2.	При большом количестве дедлоков (что уже само по себе аномалия) следите за ростом таблицы pg_deadlock_log и настраивайте ротацию/архивацию.
-
-# Тестирование
-В репозитории предусмотрен набор pytest тестов, которые:
-1.	искусственно создают дедлок между двумя соединениями;
-2.	проверяют:
-	1.	что в таблице появляется запись с sqlstate = '40P01';
-	2.	что корректно заполняются pid_victim, database_name, user_name;
-	3.	что, при наличии транзакции, логируются xid и virtualxid;
-	4.	что учитываются настройки pg_deadlock_log.enabled и pg_deadlock_log.store_query.
-
-Скрипт для запуска:
-```
-./run_tests.sh
-```
-или напрямую:
-```
-pytest
-```
 
 # Ограничения и дальнейшие улучшения
 Ограничения:

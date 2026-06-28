@@ -73,8 +73,8 @@ pg_deadlock_log_do_insert(DeadlockLogShm *snap)
         quote_literal_cstr(snap->app_name),
         quote_literal_cstr(snap->client_addr_str),
         quote_literal_cstr(snap->search_path_str),
-        quote_literal_cstr(snap->xid_str),
-        quote_literal_cstr(snap->vxid_str),
+        (snap->xid_str[0] ? quote_literal_cstr(snap->xid_str) : "NULL"),
+        (snap->vxid_str[0] ? quote_literal_cstr(snap->vxid_str) : "NULL"),
         pids_buf.data,
         quote_literal_cstr(snap->lock_cycle));
 

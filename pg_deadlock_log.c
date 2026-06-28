@@ -2,6 +2,7 @@
 #include "fmgr.h"
 
 #include "access/xact.h"
+#include "executor/spi.h"
 #include "libpq/libpq-be.h"
 #include "miscadmin.h"
 #include "postmaster/bgworker.h"
@@ -10,6 +11,7 @@
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
 #include "tcop/tcopprot.h"
+#include "utils/builtins.h"
 #include "utils/errcodes.h"
 #include "utils/elog.h"
 #include "utils/guc.h"
@@ -25,6 +27,9 @@ bool pg_deadlock_log_store_query = true;
 char *pg_deadlock_log_schema = "public";
 int pg_deadlock_log_worker_timeout = 50000;
 
+int deadlock_log_retention_days;
+int deadlock_log_max_records;
+
 /* Предыдущий deadlock-хук для цепочки вызовов */
 DeadlockLogShm *pg_deadlock_shm = NULL;
 static deadlock_log_hook_type prev_deadlock_hook = NULL;
@@ -35,6 +40,7 @@ static bool in_deadlock_hook = false;
 /* Прототипы обязательных функций */
 void _PG_init(void);
 void _PG_fini(void);
+PG_FUNCTION_INFO_V1(pg_deadlock_log_vacuum);
 
 static void pg_deadlock_log_hook(const DeadlockInfo *info);
 static void pg_deadlock_log_shmem_request(void);
@@ -111,6 +117,28 @@ void _PG_init(void)
                             100,     /* min: 100ms */
                             300000,  /* max: 5min */
                             PGC_SUSET,
+                            0,
+                            NULL, NULL, NULL);
+
+    DefineCustomIntVariable("pg_deadlock_log.retention_days",
+                            "Delete deadlock log entries older than this many days.",
+                            NULL,
+                            &deadlock_log_retention_days,
+                            30,    /* default */
+                            1,     /* min */
+                            3650,  /* max — 10 лет */
+                            PGC_SIGHUP,
+                            0,
+                            NULL, NULL, NULL);
+
+    DefineCustomIntVariable("pg_deadlock_log.max_records",
+                            "Maximum number of deadlock log entries to keep.",
+                            NULL,
+                            &deadlock_log_max_records,
+                            1000,       /* default */
+                            1,          /* min */
+                            1000000,    /* max */
+                            PGC_SIGHUP,
                             0,
                             NULL, NULL, NULL);
 
@@ -228,4 +256,53 @@ static void pg_deadlock_log_hook(const DeadlockInfo *info)
     PG_END_TRY();
 
     in_deadlock_hook = false;
+}
+
+Datum
+pg_deadlock_log_vacuum(PG_FUNCTION_ARGS)
+{
+    int         deleted_total = 0;
+    int         deleted;
+    Oid         argtypes[1];
+    Datum       values[1];
+
+    SPI_connect();
+
+    /* Шаг 1: удалить записи старше retention_days */
+    argtypes[0] = INT4OID;
+    values[0]   = Int32GetDatum(deadlock_log_retention_days);
+
+    SPI_execute_with_args(
+        "DELETE FROM pg_deadlock_log "
+        "WHERE occurred_at < now() - ($1 * interval '1 day')",
+        1, argtypes, values, NULL, false, 0);
+
+    deleted = SPI_processed;
+    deleted_total += deleted;
+
+    elog(LOG, "pg_deadlock_log_vacuum: deleted %d old records (older than %d days)",
+         deleted, deadlock_log_retention_days);
+
+    /* Шаг 2: удалить лишние записи сверх max_records */
+    argtypes[0] = INT4OID;
+    values[0]   = Int32GetDatum(deadlock_log_max_records);
+
+    SPI_execute_with_args(
+        "DELETE FROM pg_deadlock_log "
+        "WHERE id IN ("
+        "    SELECT id FROM pg_deadlock_log "
+        "    ORDER BY occurred_at DESC "
+        "    OFFSET $1"
+        ")",
+        1, argtypes, values, NULL, false, 0);
+
+    deleted = SPI_processed;
+    deleted_total += deleted;
+
+    elog(LOG, "pg_deadlock_log_vacuum: deleted %d excess records (max_records=%d)",
+         deleted, deadlock_log_max_records);
+
+    SPI_finish();
+
+    PG_RETURN_INT32(deleted_total);
 }

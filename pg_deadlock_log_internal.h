@@ -87,6 +87,8 @@ extern bool pg_deadlock_log_enabled;
 extern bool pg_deadlock_log_store_query;
 extern char *pg_deadlock_log_schema;
 extern int pg_deadlock_log_worker_timeout;
+extern int deadlock_log_retention_days;
+extern int deadlock_log_max_records;
 
 extern DeadlockLogShm *pg_deadlock_shm;
 

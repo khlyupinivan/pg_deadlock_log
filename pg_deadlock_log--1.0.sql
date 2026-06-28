@@ -26,3 +26,9 @@ CREATE TABLE pg_deadlock_log (
     all_pids         integer[]    NOT NULL DEFAULT '{}',    -- PID всех участников дедлока
     lock_cycle       text                                   -- граф блокировок: "X waits for Y; Y waits for Z"
 );
+
+CREATE OR REPLACE FUNCTION pg_deadlock_log_vacuum()
+RETURNS integer
+LANGUAGE C
+STRICT
+AS 'MODULE_PATHNAME', 'pg_deadlock_log_vacuum';
